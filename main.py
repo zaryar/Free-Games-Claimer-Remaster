@@ -21,6 +21,12 @@ import re
 import sys
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -50,6 +56,7 @@ from src.version import __version__, __author__, __repo__, __contributors__
 from rich.logging import RichHandler
 from rich.markup import escape
 from rich.console import Console
+from logging.handlers import RotatingFileHandler
 
 # This filter automatically adds the store name (e.g. "[Steam]", "[Epic]")
 # in front of every log message, so you can easily tell which module is talking.
@@ -74,10 +81,21 @@ handler = RichHandler(
 )
 handler.addFilter(StorePrefixFilter())
 
+# File logging into data/claimer.log (preserves logs across runs)
+_log_file = cfg._data_dir / "claimer.log"
+_file_handler = RotatingFileHandler(
+    _log_file,
+    maxBytes=10 * 1024 * 1024,  # 10 MB
+    backupCount=3,
+    encoding="utf-8",
+)
+_file_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)-8s %(name)s: %(message)s"))
+_file_handler.setLevel(logging.DEBUG)
+
 logging.basicConfig(
     level=logging.DEBUG if cfg.debug else logging.INFO,
     format="%(message)s",
-    handlers=[handler],
+    handlers=[handler, _file_handler],
 )
 logger = logging.getLogger("fgc")
 
@@ -463,35 +481,36 @@ async def run_claimers() -> None:
             logger.exception("✗ GamerPower side stores crashed")
 
     # Final Summary Notification
-    if cfg.notify_summary and aggregated_results:
+    if cfg.notify_summary:
         from src.core.notifier import format_game_list
         msg_parts = []
-        for result in aggregated_results:
-            # Skip stores whose notifications are silenced (NOTIFY_SKIP_STORES).
-            if not cfg.store_notify_enabled(_store_key(result.get("store", ""))):
-                continue
-            # Only real changes are reported: already-owned and skipped entries need
-            # NOTIFY_ALREADY_CLAIMED, failed ones NOTIFY_CLAIM_FAILS (both off by default).
-            keep_owned = cfg.notify_already_claimed
-            relevant_games = [
-                g for g in result["games"]
-                if "status" in g
-                and (keep_owned or "exist" not in g["status"].lower())
-                and (keep_owned or "already" not in g["status"].lower())
-                and (keep_owned or "skip" not in g["status"].lower() or "dry run" in g["status"].lower())
-                and (cfg.notify_claim_fails or "fail" not in g["status"].lower())
-                and (cfg.notify_missing_base or "missing_base" not in g["status"].lower())
-                and (cfg.notify_download_only or "download" not in g["status"].lower())
-            ]
-            
-            if not relevant_games:
-                logger.debug("Summary: nothing to report for %s (all %d entr(ies) filtered out)",
-                             result.get("store"), len(result["games"]))
-                continue
+        if aggregated_results:
+            for result in aggregated_results:
+                # Skip stores whose notifications are silenced (NOTIFY_SKIP_STORES).
+                if not cfg.store_notify_enabled(_store_key(result.get("store", ""))):
+                    continue
+                # Only real changes are reported: already-owned and skipped entries need
+                # NOTIFY_ALREADY_CLAIMED, failed ones NOTIFY_CLAIM_FAILS (both off by default).
+                keep_owned = cfg.notify_already_claimed
+                relevant_games = [
+                    g for g in result["games"]
+                    if "status" in g
+                    and (keep_owned or "exist" not in g["status"].lower())
+                    and (keep_owned or "already" not in g["status"].lower())
+                    and (keep_owned or "skip" not in g["status"].lower() or "dry run" in g["status"].lower())
+                    and (cfg.notify_claim_fails or "fail" not in g["status"].lower())
+                    and (cfg.notify_missing_base or "missing_base" not in g["status"].lower())
+                    and (cfg.notify_download_only or "download" not in g["status"].lower())
+                ]
                 
-            account = mask_account(result.get('user'))
-            header = f"**{result['store']}** ({account}):" if account else f"**{result['store']}**:"
-            msg_parts.append(f"{header}\n{format_game_list(relevant_games)}")
+                if not relevant_games:
+                    logger.debug("Summary: nothing to report for %s (all %d entr(ies) filtered out)",
+                                 result.get("store"), len(result["games"]))
+                    continue
+                    
+                account = mask_account(result.get('user'))
+                header = f"**{result['store']}** ({account}):" if account else f"**{result['store']}**:"
+                msg_parts.append(f"{header}\n{format_game_list(relevant_games)}")
             
         # Kept out of the per-store lists: the summary filter drops anything that says "skipped".
         stuck = waiting_for_you()
@@ -500,11 +519,43 @@ async def run_claimers() -> None:
                      for name, count in sorted(stuck.items())]
             msg_parts.append("🙋 Needed you:\n" + "\n".join(lines))
 
+        # Check if ANY game was actually successfully claimed or if errors occurred
+        has_success = False
+        all_failed_games = []
+        if aggregated_results:
+            for res in aggregated_results:
+                for g in res.get("games", []):
+                    st = g.get("status", "").lower()
+                    if ("claim" in st or "success" in st or "added" in st) and "fail" not in st and "skip" not in st:
+                        has_success = True
+                    elif "fail" in st:
+                        all_failed_games.append((res.get("store", "Store"), g))
+
         if msg_parts:
-            final_msg = "\n\n".join(msg_parts)
+            header = "🎉 **Free Games Claimer (PC-Start) - Neue Spiele gesichert:**" if has_success else "⚠️ **Free Games Claimer (PC-Start) - Status & Meldungen:**"
+            final_msg = f"{header}\n\n" + "\n\n".join(msg_parts)
             if cfg.dryrun:
                 final_msg = "🛑 **DRY RUN SUMMARY: games remaining to be claimed**\n\n" + final_msg
             await notify(final_msg)
+        elif getattr(cfg, "notify_empty_summary", True):
+            if isinstance(cfg.stores, str):
+                stores_list = [s.strip().upper() for s in cfg.stores.split(",") if s.strip()]
+            else:
+                stores_list = [str(s).upper() for s in cfg.stores]
+            stores_str = ", ".join(stores_list)
+
+            if all_failed_games:
+                fail_lines = [f"• **{store}**: {g.get('title')} ({g.get('status')})" for store, g in all_failed_games[:10]]
+                if len(all_failed_games) > 10:
+                    fail_lines.append(f"... und {len(all_failed_games) - 10} weitere.")
+                await notify(
+                    f"⚠️ **Free Games Claimer (PC-Start): Achtung, Probleme aufgetreten!**\n"
+                    f"Bei {len(all_failed_games)} Spiel(en) gab es Fehler (z. B. Store nicht eingeloggt):\n\n"
+                    + "\n".join(fail_lines) +
+                    f"\n\n👉 Bitte prüfe deine Logindaten in der `.env` oder starte `EINMALIG_EINLOGGEN.bat`."
+                )
+            else:
+                await notify(f"⚠️ **Free Games Claimer (PC-Start): Keine neuen Games da!**\nAktuell sind alle deine Stores ({stores_str}) auf dem neuesten Stand. Es gab keine neuen Gratis-Games zum Aktivieren. ✅")
 
     logger.info("✔ Claiming run complete.")
 
@@ -573,8 +624,8 @@ async def main() -> None:
         logger.info("✅ Test notification dispatched! Check your configured services. "
                      "Set NOTIFY_TEST=0 in your .env to disable this on future restarts.")
 
-    # If --once flag is set, run a single pass and exit
-    if "--once" in sys.argv:
+    # If --once flag is set or RUN_ONCE=true, run a single pass and exit
+    if "--once" in sys.argv or os.getenv("RUN_ONCE", "").lower() in ("true", "1"):
         await run_claimers()
         return
 

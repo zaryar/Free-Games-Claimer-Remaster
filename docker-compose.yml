@@ -1,12 +1,7 @@
 services:
-  # ---------------------------------------------------------------
-  # Free Games Claimer Remaster
-  # ---------------------------------------------------------------
   app:
-    # To run the experimental development build, set FGC_TAG=dev in your .env file!
     image: ghcr.io/p-adamiec/free-games-claimer-remaster:${FGC_TAG:-latest}
     container_name: fgc-remaster
-    build: .
     restart: unless-stopped
     tty: true
     stdin_open: true
@@ -14,6 +9,9 @@ services:
       - "${NOVNC_PORT:-7080}:7080"
     volumes:
       - fgc_data:/fgc/data
+      - ./main.py:/fgc/main.py
+      - ./login_helper.py:/fgc/login_helper.py
+      - ./src/core/config.py:/fgc/src/core/config.py
     env_file:
       - .env
     healthcheck:
