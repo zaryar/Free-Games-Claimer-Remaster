@@ -73,6 +73,12 @@ STORES = {
         "url": "https://www.aliexpress.com/",
         "profile": DATA_BROWSER_DIR / "aliexpress",
     },
+    "11": {
+        "name": "Microsoft Store",
+        "key": "microsoft",
+        "url": "https://account.microsoft.com/",
+        "profile": DATA_BROWSER_DIR / "microsoft",
+    },
 }
 
 async def open_login(store_info: dict) -> None:

@@ -20,6 +20,7 @@ Der Free Games Claimer läuft direkt auf deinem Windows-PC, beansprucht vollauto
 | *IndieGala* | ⚙️ Optional | Auto-Claim | IndieGala-Account; Login via [8] |
 | *Unity Asset Store* | ⚙️ Optional | Auto-Claim | Unity-Account mit Rechnungsadresse; Login via [9] |
 | *AliExpress* | ⚙️ Optional | Münz-Check-in | Täglicher Münz-Check-in via [10] |
+| *Microsoft Store* | ⚙️ Optional | Auto-Claim | Microsoft-Account; Login via [11] oder `MS_EMAIL`/`MS_PASSWORD` in `.env` |
 
 ---
 
