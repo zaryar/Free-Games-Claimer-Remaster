@@ -76,7 +76,7 @@ STORES = {
     "11": {
         "name": "Microsoft Store",
         "key": "microsoft",
-        "url": "https://account.microsoft.com/",
+        "url": "https://account.microsoft.com/billing/redeem",
         "profile": DATA_BROWSER_DIR / "microsoft",
     },
 }
