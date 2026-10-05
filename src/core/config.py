@@ -248,6 +248,7 @@ class Config:
     notify_updates: bool = _bool("NOTIFY_UPDATES", default=True)
     notify_login_request: bool = _bool("NOTIFY_LOGIN_REQUEST", default=True)
     notify_test: bool = _bool("NOTIFY_TEST", default=False)
+    notify_empty_summary: bool = _bool("NOTIFY_EMPTY_SUMMARY", default=True)
     # Outcomes that repeat every run because the user cannot do anything about them.
     notify_missing_base: bool = _bool("NOTIFY_MISSING_BASE", default=True)
     notify_download_only: bool = _bool("NOTIFY_DOWNLOAD_ONLY", default=True)
