@@ -170,9 +170,10 @@ async def main():
         print("  [8] IndieGala einloggen")
         print("  [9] Unity Asset Store einloggen")
         print("  [10] AliExpress einloggen")
+        print("  [11] Microsoft Store einloggen")
         print("  [q] Beenden")
         print("========================================================")
-        choice = input("Waehle einen Store (1-10 oder q): ").strip()
+        choice = input("Waehle einen Store (1-11 oder q): ").strip()
         if choice.lower() == "q":
             print("Beende Login-Assistent.")
             break
