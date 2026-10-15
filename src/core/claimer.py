@@ -649,10 +649,16 @@ class BaseClaimer:
 
     def _vnc_notice(self, title: str, body: str, timeout: int | None = None) -> str:
         """Build a consistent 'do X via VNC' notification with the autoconnect link."""
+        import sys
         timeout = timeout or cfg.vnc_login_timeout
+        action_line = (
+            "🖥️ **Aktion (PC):** Löse die Abfrage im Browser oder starte `EINMALIG_EINLOGGEN.bat`"
+            if sys.platform == "win32"
+            else f"🌐 **Open VNC:** {cfg.vnc_url}"
+        )
         return (
             f"🔐 **{title}**\n\n{body}\n"
-            f"🌐 **Open VNC:** {cfg.vnc_url}\n"
+            f"{action_line}\n"
             f"⏱️ **Timeout:** waiting {timeout}s"
         )
 

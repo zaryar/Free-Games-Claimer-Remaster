@@ -16,7 +16,7 @@ STORES = {
     "1": {
         "name": "Epic Games",
         "key": "epic",
-        "url": "https://store.epicgames.com/login",
+        "url": "https://store.epicgames.com/en-US/free-games",
         "profile": DATA_BROWSER_DIR / "epic",
     },
     "2": {
