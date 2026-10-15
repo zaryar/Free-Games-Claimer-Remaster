@@ -25,10 +25,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from src.core.browser_timezone import refresh as refresh_browser_timezone
 from src.core.config import cfg, settings_warnings
 from src.core.claimer import mask_account
+from src.core.redact import RedactFilter, hide_settings
 from src.core.database import init_db
-from src.core.run_state import reset_run_state, waiting_for_you
+from src.core.run_state import reset_run_state, set_next_run_source, waiting_for_you
 from src.core.selection import apply_run_selection
 from src.core.updates import notify_if_update_available
 from src.stores.aliexpress import claim_aliexpress
@@ -58,8 +60,8 @@ class StorePrefixFilter(logging.Filter):
     def filter(self, record):
         if record.name.startswith("fgc."):
             store = record.name.split(".")[-1]
-            if store in ("epic", "steam", "gog", "prime", "microsoft", "aliexpress", "ubisoft", "fab", "unity"):
-                store_map = {"gog": "GOG", "epic": "Epic", "steam": "Steam", "prime": "Prime", "microsoft": "Microsoft", "aliexpress": "AliExpress", "ubisoft": "Ubisoft", "fab": "Fab", "unity": "Unity"}
+            if store in ("epic", "steam", "gog", "prime", "microsoft", "aliexpress", "ubisoft", "fab", "unity", "legacygames"):
+                store_map = {"gog": "GOG", "epic": "Epic", "steam": "Steam", "prime": "Prime", "microsoft": "Microsoft", "aliexpress": "AliExpress", "ubisoft": "Ubisoft", "fab": "Fab", "unity": "Unity", "legacygames": "Legacy Games"}
                 prefix = escape(f"[{store_map[store]}]")
                 # Prepend to the message template
                 record.msg = f"{prefix} {record.msg}"
@@ -74,6 +76,9 @@ handler = RichHandler(
     markup=True,
 )
 handler.addFilter(StorePrefixFilter())
+# Passwords, sign-in names, notification tokens and game codes are masked in every line, whoever writes it.
+hide_settings(cfg)
+handler.addFilter(RedactFilter())
 
 # File logging into data/claimer.log (preserves logs across runs)
 _log_file = cfg._data_dir / "claimer.log"
@@ -85,6 +90,8 @@ _file_handler = RotatingFileHandler(
 )
 _file_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)-8s %(name)s: %(message)s"))
 _file_handler.setLevel(logging.DEBUG)
+_file_handler.addFilter(StorePrefixFilter())
+_file_handler.addFilter(RedactFilter())
 
 logging.basicConfig(
     level=logging.DEBUG if cfg.debug else logging.INFO,
@@ -97,11 +104,17 @@ logger = logging.getLogger("fgc")
 # HTTP handshake, every SQLite call. DEBUG=true is about the bot, DEBUG_LIBS about these.
 NOISY_LIBRARIES = (
     "nodriver", "uc", "websockets", "httpx", "httpcore",
-    "aiosqlite", "sqlalchemy", "apscheduler", "tzlocal", "asyncio", "apprise",
+    "aiosqlite", "sqlalchemy", "apscheduler", "tzlocal", "asyncio", "apprise", "markdown",
+    # Apprise sends through urllib3, whose request lines carry a Telegram bot token (#86).
+    "urllib3",
 )
 if not cfg.debug_libs:
     for _name in NOISY_LIBRARIES:
         logging.getLogger(_name).setLevel(logging.WARNING)
+else:
+    # Result rows can hold a game code the mask has not learned yet, so SQL shows statements only.
+    for _name in ("sqlalchemy.engine", "aiosqlite"):
+        logging.getLogger(_name).setLevel(logging.INFO)
 
 
 # asyncio warns about Chrome PIDs we deliberately reaped ourselves in close_browser().
@@ -134,15 +147,19 @@ ALL_CLAIMERS: dict[str, tuple[str, object]] = {
 # Each one needs an account there, so none of them runs unless STORES names it.
 SIDE_STORES: tuple[str, ...] = ("itchio", "fanatical", "indiegala", "alienware")
 
+# Stores that only redeem codes another store saved, so they run after it; chosen in STORES like any other.
+REDEEM_STORES: dict[str, str] = {"legacygames": "Legacy Games"}
+
 # Stores GamerPower hands its finds to. Naming one of these is reason enough to ask GamerPower.
 GP_TARGETS: tuple[str, ...] = ("steam", "epic", "gog", "microsoft")
 
 # What runs when neither the CLI nor STORES names anything. GamerPower goes last so the
 # stores with their own module claim first and its database dedup can do its job.
-DEFAULT_STORES: list[str] = ["steam", "epic", "prime", "gog", "microsoft", "ubisoft", "aliexpress"]
+DEFAULT_STORES: list[str] = ["steam", "epic", "prime", "gog", "microsoft", "ubisoft", "aliexpress", "legacygames"]
 
 # Display name (e.g. "Prime Gaming") → canonical store key (e.g. "prime").
-_DISPLAY_TO_KEY: dict[str, str] = {disp: key for key, (disp, _) in ALL_CLAIMERS.items()}
+_DISPLAY_TO_KEY: dict[str, str] = {disp: key for key, (disp, _) in ALL_CLAIMERS.items()} \
+    | {disp: key for key, disp in REDEEM_STORES.items()}
 
 
 def _store_key(name: str) -> str:
@@ -184,6 +201,10 @@ _ALIASES: dict[str, str] = {
     "alienware-arena": "alienware",
     "awa":           "alienware",
     # GamerPower is no longer a store of its own, see _resolve_stores().
+    "legacygames":   "legacygames",
+    "legacy-games":  "legacygames",
+    "legacy":        "legacygames",
+    "lg":            "legacygames",
     "gamerpower":    "gamerpower",
     "gp":            "gamerpower",
 }
@@ -251,7 +272,7 @@ def _scheduler_timezone() -> ZoneInfo:
 
 def _selectable() -> list[str]:
     """Every name STORES accepts: a store with a module, and a site GamerPower claims."""
-    return list(ALL_CLAIMERS) + list(SIDE_STORES)
+    return list(ALL_CLAIMERS) + list(SIDE_STORES) + list(REDEEM_STORES)
 
 
 def _resolve_stores(raw: list[str]) -> list[str]:
@@ -351,23 +372,44 @@ def _print_banner() -> None:
 # Orchestration
 # ---------------------------------------------------------------------------
 
+# The running scheduler, so a run knows when the next one comes; None for a single run.
+_scheduler = None
+
+
+def _next_scheduled_run():
+    """The earliest next start of a repeating job, or None when no later run is scheduled."""
+    if _scheduler is None:
+        return None
+    times = [job.next_run_time for job in _scheduler.get_jobs()
+             if job.next_run_time and job.id != "claim_all_startup"]
+    return min(times) if times else None
+
+
 async def run_claimers() -> None:
     """Run selected claimers sequentially (they each open their own browser)."""
     # Each run starts fresh: a store that was waiting for you hours ago gets another chance.
     reset_run_state()
+    logger.debug("Next scheduled run: %s", _next_scheduled_run() or "none, this is the last one")
     selected = _selected_stores()
     claimers = _get_active_claimers(selected)
     sides = [key for key in selected if key in SIDE_STORES]
+    redeemers = [key for key in selected if key in REDEEM_STORES]
 
-    if not claimers and not sides:
+    if not claimers and not sides and not redeemers:
         logger.warning("No valid stores selected. Nothing to do.")
         return
 
     store_names = [name for _, name, _ in claimers]
-    logger.info("🎮 Starting claiming run… %s", ", ".join(store_names + sides))
+    logger.info("🎮 Starting claiming run… %s", ", ".join(store_names + sides + [REDEEM_STORES[k] for k in redeemers]))
 
     # Long-running containers never restart, so this is the only place they'd hear about a release.
     await notify_if_update_available()
+
+    # Before any browser starts, so every store's Chrome shows the time zone your IP address is in.
+    try:
+        await refresh_browser_timezone()
+    except Exception as e:
+        logger.debug("Browser time zone left as it was: %s", e)
 
     # GamerPower first: it finds giveaways, the stores below claim them. One pass, and only
     # when something in this run can use it.
@@ -382,7 +424,9 @@ async def run_claimers() -> None:
             logger.debug("▶ Running %s claimer…", name)
             res = await func(routed.get(key)) if key in GP_TARGETS else await func()
             if isinstance(res, dict):
-                logger.debug("%s returned %d game entr(ies): %s", name, len(res.get("games") or []), res.get("games"))
+                # Titles only: Prime's statuses and links carry whole game codes.
+                logger.debug("%s returned %d game entr(ies): %s", name, len(res.get("games") or []),
+                             [g.get("title") for g in res.get("games") or []])
             if isinstance(res, dict) and res.get("games"):
                 aggregated_results.append(res)
         except Exception:
@@ -449,6 +493,22 @@ async def run_claimers() -> None:
         except Exception:
             logger.exception("Failed to run post-claim Microsoft code redemption")
 
+    # Legacy Games codes from Prime Gaming, redeemed into the LG_EMAIL account in the same run: they expire within days.
+    if "legacygames" not in redeemers:
+        logger.debug("Skipping Legacy Games codes as 'legacy' is not in STORES.")
+    else:
+        try:
+            from src.stores.legacygames import LegacyGamesClaimer
+
+            lg_claimer = LegacyGamesClaimer()
+            await lg_claimer.redeem_pending_codes()
+            if lg_claimer.notify_games:
+                aggregated_results.append(
+                    {"store": "Legacy Games", "user": lg_claimer.user, "games": lg_claimer.notify_games}
+                )
+        except Exception:
+            logger.exception("Failed to run post-claim Legacy Games code redemption")
+
     # Last: the sites with no module of their own, all in one browser window.
     if sides and routed:
         try:
@@ -476,7 +536,7 @@ async def run_claimers() -> None:
 
     # Final Summary Notification
     if cfg.notify_summary:
-        from src.core.notifier import format_game_list
+        from src.core.notifier import format_game_list, markdown_safe
         msg_parts = []
         if aggregated_results:
             for result in aggregated_results:
@@ -493,6 +553,7 @@ async def run_claimers() -> None:
                     and (keep_owned or "skip" not in g["status"].lower() or "dry run" in g["status"].lower())
                     and (cfg.notify_claim_fails or "fail" not in g["status"].lower())
                     and (cfg.notify_missing_base or "missing_base" not in g["status"].lower())
+                    and "skipped:missing_base" not in g["status"].lower()
                     and (cfg.notify_download_only or "download" not in g["status"].lower())
                 ]
                 
@@ -501,14 +562,15 @@ async def run_claimers() -> None:
                                  result.get("store"), len(result["games"]))
                     continue
                     
-                account = mask_account(result.get('user'))
+                # The mask's "***" would open bold on Discord and Telegram and swallow the line below.
+                account = markdown_safe(mask_account(result.get('user'))) if result.get('user') else ""
                 header = f"**{result['store']}** ({account}):" if account else f"**{result['store']}**:"
                 msg_parts.append(f"{header}\n{format_game_list(relevant_games)}")
             
         # Kept out of the per-store lists: the summary filter drops anything that says "skipped".
         stuck = {name: count for name, count in waiting_for_you().items() if cfg.store_notify_enabled(name)}
         if stuck:
-            lines = [f"**{name.title()}**: waiting for you, {count} skipped"
+            lines = [f"**{REDEEM_STORES.get(name, name.title())}**: waiting for you, {count} skipped"
                      for name, count in sorted(stuck.items())]
             msg_parts.append("🙋 Needed you:\n" + "\n".join(lines))
 
@@ -521,7 +583,11 @@ async def run_claimers() -> None:
                     st = g.get("status", "").lower()
                     if ("claim" in st or "success" in st or "added" in st) and "fail" not in st and "skip" not in st:
                         has_success = True
-                    elif "fail" in st:
+                    elif (
+                        "fail" in st
+                        and cfg.notify_claim_fails
+                        and (cfg.notify_missing_base or "missing_base" not in st)
+                    ):
                         all_failed_games.append((res.get("store", "Store"), g))
 
         if msg_parts:
@@ -553,6 +619,22 @@ async def run_claimers() -> None:
     logger.info("✔ Claiming run complete.")
 
 
+async def reset_recent_games(session_factory=None, days: int = 7) -> int:
+    """RESET_DB_GAMES: forget the last days' claims, never a row holding a code or key still to redeem."""
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import delete, or_
+    from src.core.database import async_session, ClaimedGame
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    async with (session_factory or async_session)() as session:
+        res = await session.execute(delete(ClaimedGame).where(
+            ClaimedGame.created_at >= since,
+            or_(ClaimedGame.code.is_(None), ClaimedGame.code == ""),
+        ))
+        await session.commit()
+        return res.rowcount
+
+
 async def run_claimers_scheduled() -> None:
     """Run claimers from scheduler jobs without overlapping executions."""
     if _claim_run_lock.locked():
@@ -571,9 +653,11 @@ async def main() -> None:
     # Effective settings (no credentials), the first thing worth knowing in a bug report.
     logger.debug(
         "Settings: dryrun=%s debug_libs=%s show=%s %dx%d stores=%r scheduler_hours=%s fixed=%r tz=%s "
+        "browser_tz=%s/%s TZ=%s "
         "notify(summary=%s errors=%s fails=%s login=%s skip=%s) eg_mobile=%s(%s) data=%s",
         cfg.dryrun, cfg.debug_libs, cfg.show, cfg.width, cfg.height, cfg.stores or "all",
         cfg.scheduler_hours, cfg.scheduler_fixed_times, cfg.scheduler_timezone,
+        cfg.browser_timezone, cfg.browser_timezone_refresh, cfg.tz or "unset",
         cfg.notify_summary, cfg.notify_errors, cfg.notify_claim_fails, cfg.notify_login_request,
         sorted(cfg.notify_skip_stores) or "none", cfg.eg_mobile, ",".join(cfg.eg_mobile_platform_list) or "none",
         cfg._data_dir,
@@ -584,20 +668,12 @@ async def main() -> None:
 
     if cfg.reset_db_games:
         try:
-            from datetime import datetime, timedelta, timezone
-            from src.core.database import async_session, ClaimedGame
-            from sqlalchemy import delete
-            
-            seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
-            
-            async with async_session() as session:
-                stmt = delete(ClaimedGame).where(ClaimedGame.created_at >= seven_days_ago)
-                res = await session.execute(stmt)
-                if res.rowcount > 0:
-                    logger.info("Reset %d entry(s) from the last 7 days from history.", res.rowcount)
-                else:
-                    logger.debug("DB reset requested, but no entries found from the last 7 days.")
-                await session.commit()
+            removed = await reset_recent_games()
+            if removed > 0:
+                logger.info("Reset %d entry(s) from the last 7 days from history, codes still to redeem kept. "
+                            "This runs at every start until you set RESET_DB_GAMES=false again.", removed)
+            else:
+                logger.debug("DB reset requested, but no entries found from the last 7 days.")
         except Exception as e:
             logger.error("Failed to reset DB games: %s", e)
 
@@ -646,7 +722,10 @@ async def main() -> None:
 
     # Otherwise start the scheduler
 
+    global _scheduler
     scheduler = AsyncIOScheduler(job_defaults=_CLAIM_JOB_OPTIONS)
+    _scheduler = scheduler
+    set_next_run_source(_next_scheduled_run)
     if cfg.scheduler_hours > 0:
         scheduler.add_job(
             run_claimers_scheduled,
