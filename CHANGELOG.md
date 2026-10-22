@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project does not follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html): every release raises the number after the dot (1.10, 1.11), and a development build carries the same number with a `d` suffix (`v1.11d`). The version being worked on stays at the top without a date until it is released.
 
+## [1.18] - 2026-10-21
+
+### Changed
+- **Debian 13 in the image** – the `Dockerfile` builds on `debian:trixie-slim` instead of Debian 12, which brings Python 3.13, noVNC 1.6 and longer security support. Chrome on x86-64 and Chromium on the Raspberry Pi stay as they were; `docker compose pull` is all you do. If Chromium no longer starts on your Raspberry Pi, please open an issue.
+- **Apprise 2** – `requirements.txt` moves notifications to `apprise>=2.0.1,<3`. `markdown_ready()` in `src/core/notifier.py` keeps Telegram on HTML, so game names stay bold links there, and Pushover and Matrix now show bold text and links too. Slack should as well: if yours still shows asterisks, please open an issue. Nothing in your settings changes.
+- **Dependency updates** – `sqlalchemy` to `>=2.1.6` (Dependabot [#92](https://github.com/P-Adamiec/Free-Games-Claimer-Remaster/pull/92)).
+
+### Fixed
+- **AliExpress collects in every language of its coin page ([#93](https://github.com/P-Adamiec/Free-Games-Claimer-Remaster/issues/93))** – `_read_checkin_state()` in `src/stores/aliexpress.py` knows the check-in labels in all 18 languages, taken from AliExpress's own translations, finds the check-in button by the name the page's code gives it when its label is new, and reads a collected day from the calendar's own mark. Before, a German account was left uncollected.
+
+## [1.17] - 2026-10-21
+
+### Changed
+- **Dependency updates** – `nodriver` to `>=0.50.6`, `sqlalchemy` to `>=2.1.4`, `tenacity` to `>=9.2.1`, `tzdata` to `>=2026.5` and `python-dotenv` to `>=1.2.4` (Dependabot [#85](https://github.com/P-Adamiec/Free-Games-Claimer-Remaster/pull/85)). The image for this release already ran on these versions in its test passes.
+
+### Fixed
+- **Epic picks your saved account by itself (PR [#91](https://github.com/P-Adamiec/Free-Games-Claimer-Remaster/pull/91) by @jcugat)** – `_pick_saved_account()` in `src/stores/epic.py` clicks your tile on Epic's "Welcome back" list, matching `EG_EMAIL` also in the masked form Epic shows, and takes a lone tile only without `EG_EMAIL`. When none is yours, the bot signs in through "Use another account" and asks you only without credentials.
+- **Unity claims work for US accounts ([#89](https://github.com/P-Adamiec/Free-Games-Claimer-Remaster/issues/89))** – `_prepare_checkout()` in `src/stores/unity.py` waited for the consumption-tax question, which Unity shows only in some countries, and gave up on a US checkout that was already there. It now waits for the billing address, gives the tax question a few seconds, and a checkout that never loads shows as `failed:checkout` instead of a hidden skip.
+- **A GOG code someone already used is no longer reported as redeemed** – `gog_redeem_outcome()` in `src/stores/gog.py` reads "already redeemed" before success, where the word "redeemed" used to win. An unclear answer shows as failed and the next run tries the code again, instead of asking you to check it.
+- **Unity no longer fills your cart** – `_start_checkout()` in `src/stores/unity.py` presses only "Buy Now". "Add to cart" never opened the checkout and left the asset in your cart on every run.
+- **Fab claims free assets again** – Epic's newer checkout shows a free asset with its price only, no total line, so `checkout_total_is_zero()` in `src/stores/epic.py` read nothing and Fab ordered nothing. It now reads the prices in any currency and language, leaving out the asset's title, and orders only when all of them are zero.
+- **The log no longer says the bot asks you again when it does not** – `_wait_out_challenge()` in `src/core/claimer.py` skips a captcha quietly once nobody answered that store's last prompt in the run, instead of logging another "requesting manual solve via VNC" it never sends.
+- **Browser profiles take less disk space** – `start_browser()` in `src/core/claimer.py` caps Chrome's two caches, downloaded files and compiled scripts, at 250 MB each per store. Before, Chrome let the busiest profiles in `data/browser` keep over a gigabyte of downloaded files; the next run trims them, and your sign-ins stay.
+- **Prime goes back for a code it could not read** – `_claim_internal_games()` in `src/stores/prime.py` opens a claimed GOG or Legacy Games tile again on the next run when its code was not on the page yet, so the code still gets redeemed. Before, such a game was saved as claimed and never visited again unless `PG_FORCE_CHECK_COLLECTED` was on.
+
 ## [1.16] - 2026-10-16
 
 A hotfix for Epic Games: the mouse clicks 1.13 brought in to draw fewer captchas missed Epic's new checkout frame, so Epic claims stopped on 1.13 to 1.15. Epic keeps changing its site and anti-bot checks, so a problem there can come from their side too, and an issue with your log helps the bot catch up. The more users run the development build, the sooner such a change is caught there, before a release. If you are a technical user, please set `FGC_TAG=dev`, keep `DEBUG=true` (the default) and report what you see.
@@ -438,6 +463,8 @@ Steam no longer reads SteamDB: free Steam games now come from GamerPower and Ste
 - ❌ `unrealengine.js` – Out of scope
 - ❌ `steam-games.js` – Only scraped profiles, never claimed games
 
+[1.18]: https://github.com/P-Adamiec/Free-Games-Claimer-Remaster/compare/v1.17...v1.18
+[1.17]: https://github.com/P-Adamiec/Free-Games-Claimer-Remaster/compare/v1.16...v1.17
 [1.16]: https://github.com/P-Adamiec/Free-Games-Claimer-Remaster/compare/v1.15...v1.16
 [1.15]: https://github.com/P-Adamiec/Free-Games-Claimer-Remaster/compare/v1.14...v1.15
 [1.14]: https://github.com/P-Adamiec/Free-Games-Claimer-Remaster/compare/v1.13...v1.14

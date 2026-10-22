@@ -104,9 +104,11 @@ logger = logging.getLogger("fgc")
 # HTTP handshake, every SQLite call. DEBUG=true is about the bot, DEBUG_LIBS about these.
 NOISY_LIBRARIES = (
     "nodriver", "uc", "websockets", "httpx", "httpcore",
-    "aiosqlite", "sqlalchemy", "apscheduler", "tzlocal", "asyncio", "apprise", "markdown",
+    "aiosqlite", "sqlalchemy", "apscheduler", "tzlocal", "asyncio", "apprise",
     # Apprise sends through urllib3, whose request lines carry a Telegram bot token (#86).
     "urllib3",
+    # python-markdown, which Apprise uses to write HTML, logs under the upper-case name.
+    "MARKDOWN",
 )
 if not cfg.debug_libs:
     for _name in NOISY_LIBRARIES:
@@ -405,7 +407,8 @@ async def run_claimers() -> None:
         return
 
     store_names = [name for _, name, _ in claimers]
-    logger.info("🎮 Starting claiming run… %s", ", ".join(store_names + sides + [REDEEM_STORES[k] for k in redeemers]))
+    logger.info("🎮 Starting claiming run… %s", ", ".join(
+        store_names + [_KEY_TO_DISPLAY.get(k, k) for k in sides] + [REDEEM_STORES[k] for k in redeemers]))
 
     # Long-running containers never restart, so this is the only place they'd hear about a release.
     await notify_if_update_available()
