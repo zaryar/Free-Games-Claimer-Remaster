@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 if sys.platform == "win32":
@@ -36,15 +37,19 @@ from src.core.config import cfg, settings_warnings
 from src.core.claimer import mask_account
 from src.core.redact import RedactFilter, hide_settings
 from src.core.database import init_db
-from src.core.run_state import describe_wait, reset_run_state, set_next_run_source, waiting_for_you
+from src.core.human_checks import week_summary
+from src.core.display import vnc_viewers
+from src.core.run_state import (booked, describe_wait, reset_run_state, set_next_run_source, unbook, utc_text,
+                                waiting_for_you)
 from src.core.selection import apply_run_selection
 from src.core.updates import notify_if_update_available
 from src.stores.aliexpress import claim_aliexpress
-from src.stores.epic import claim_epic
-from src.stores.epic_fab import claim_fab
+from src.stores.epic import claim_epic, claim_epic_booked
+from src.stores.epic_fab import claim_fab, claim_fab_booked
 from src.stores.gamerpower import SIDE_STORE_KEYS, claim_side_stores, discover_giveaways
 from src.stores.gog import claim_gog
 from src.stores.microsoft import claim_microsoft
+from src.stores.ms_rewards import claim_ms_rewards
 from src.stores.prime import claim_prime
 from src.stores.steam import claim_steam
 from src.stores.unity import claim_unity
@@ -66,11 +71,12 @@ class StorePrefixFilter(logging.Filter):
     def filter(self, record):
         if record.name.startswith("fgc."):
             store = record.name.split(".")[-1]
-            if store in ("epic", "steam", "gog", "prime", "microsoft", "aliexpress", "ubisoft", "fab", "unity", "legacygames"):
-                store_map = {"gog": "GOG", "epic": "Epic", "steam": "Steam", "prime": "Prime", "microsoft": "Microsoft", "aliexpress": "AliExpress", "ubisoft": "Ubisoft", "fab": "Fab", "unity": "Unity", "legacygames": "Legacy Games"}
+            if store in ("epic", "steam", "gog", "prime", "microsoft", "msrewards", "aliexpress", "ubisoft", "fab", "unity", "legacygames"):
+                store_map = {"gog": "GOG", "epic": "Epic", "steam": "Steam", "prime": "Prime", "microsoft": "Microsoft", "msrewards": "Microsoft Rewards", "aliexpress": "AliExpress", "ubisoft": "Ubisoft", "fab": "Fab", "unity": "Unity", "legacygames": "Legacy Games"}
                 prefix = escape(f"[{store_map[store]}]")
-                # Prepend to the message template
-                record.msg = f"{prefix} {record.msg}"
+                # Prepend to the message template once (console and file handlers both run this filter)
+                if not str(record.msg).startswith(prefix):
+                    record.msg = f"{prefix} {record.msg}"
         return True
 
 handler = RichHandler(
@@ -146,6 +152,7 @@ ALL_CLAIMERS: dict[str, tuple[str, object]] = {
     "prime":      ("Prime Gaming", claim_prime),
     "gog":        ("GOG",          claim_gog),
     "microsoft":  ("Microsoft",    claim_microsoft),
+    "msrewards":  ("Microsoft Rewards", claim_ms_rewards),
     "ubisoft":    ("Ubisoft",      claim_ubisoft),
     "unity":      ("Unity",        claim_unity),
     "aliexpress": ("AliExpress",   claim_aliexpress),
@@ -198,6 +205,11 @@ _ALIASES: dict[str, str] = {
     "microsoft-store": "microsoft",
     "ms":            "microsoft",
     "xbox":          "microsoft",
+    "msrewards":     "msrewards",
+    "ms-rewards":    "msrewards",
+    "microsoft-rewards": "msrewards",
+    "rewards":       "msrewards",
+    "bing-rewards":  "msrewards",
     "ubisoft":       "ubisoft",
     "ubi":           "ubisoft",
     "unity":         "unity",
@@ -398,6 +410,189 @@ def _next_scheduled_run():
     return min(times) if times else None
 
 
+# Stores whose checkout can keep a puzzle nobody solved for a meeting with you in noVNC.
+MEETINGS = {"epic": ("Epic Games", claim_epic_booked), "fab": ("Fab", claim_fab_booked)}
+# How often the bot looks whether you opened noVNC while it waits for you.
+MEETING_LOOK = 10
+
+
+async def warn_open_novnc() -> None:
+    """Tell you once per start when noVNC has no password and its address in VNC_URL or VNC_IP is public."""
+    from urllib.parse import urlsplit
+
+    from src.core.redact import public_host
+    link = urlsplit(cfg.vnc_url)
+    public, guarded = public_host(link.hostname or ""), bool(link.password)
+    # A login in VNC_URL means a proxy asks for one before noVNC.
+    if cfg.vnc_password_set or guarded or not public:
+        logger.debug("noVNC password check: password set=%s, proxy login=%s, public address=%s.",
+                     cfg.vnc_password_set, guarded, public)
+        return
+    logger.debug("noVNC has no password at a public address, sending the warning.")
+    await notify("🔓 **noVNC has no password**\n\nYour noVNC address is public and `VNC_PASSWORD` is empty, so anyone who "
+                 "finds it can use the browser signed in to your stores. Set `VNC_PASSWORD` in `.env` and restart the "
+                 "container (unless a reverse proxy in front asks for a login).\n"
+                 f"🌐 {cfg.vnc_url}")
+
+
+async def tell_bookings() -> None:
+    """One notification for the puzzles kept since the last one, so you can come while the run goes on."""
+    for store, items in booked().items():
+        new = [item for item in items if not item.get("told")]
+        for item in new:
+            item["told"] = True
+        if not new or not (cfg.notify_login_request and cfg.store_notify_enabled(store)):
+            continue
+        from src.core.notifier import markdown_safe
+        lines = "\n".join(f"• {markdown_safe(item['title'])}: until {utc_text(item['until'])}" for item in new)
+        await notify(f"🧩 **{MEETINGS[store][0]}: a captcha needs you**\n\n{lines}\n\n"
+                     "Open noVNC before then (reload it if it is already open): once you connect, the bot opens the "
+                     "checkout again (after the store it is on) and you solve a fresh puzzle, which expires about two "
+                     "minutes after it shows.\n"
+                     f"🌐 **Open VNC:** {cfg.vnc_url}")
+
+
+def kept_lines() -> list:
+    """The summary's lines for what waits for you in noVNC, for the stores whose notifications are on."""
+    from src.core.notifier import markdown_safe
+    return [f"**{MEETINGS[store][0]}**: {markdown_safe(item['title'])}, until {utc_text(item['until'])}"
+            for store, items in booked().items() if cfg.store_notify_enabled(store) for item in items]
+
+
+def summary_games(result: dict) -> list:
+    """A store's entries the summary shows, by the NOTIFY_* switches."""
+    # Owned and skipped entries need NOTIFY_ALREADY_CLAIMED (off), failed ones NOTIFY_CLAIM_FAILS (on).
+    keep_owned = cfg.notify_already_claimed
+    relevant_games = [
+        g for g in result["games"]
+        if "status" in g
+        and (keep_owned or "exist" not in g["status"].lower())
+        and (keep_owned or "already" not in g["status"].lower())
+        and (keep_owned or "skip" not in g["status"].lower() or "dry run" in g["status"].lower())
+        and (cfg.notify_claim_fails or "fail" not in g["status"].lower())
+        and (cfg.notify_missing_base or "missing_base" not in g["status"].lower())
+        and "skipped:missing_base" not in g["status"].lower()
+        and (cfg.notify_download_only or "download" not in g["status"].lower())
+    ]
+    return relevant_games
+
+
+def store_time_limit() -> int:
+    """Seconds one store may run: an hour, plus four of its waits for you in noVNC."""
+    return 3600 + 4 * cfg.vnc_login_timeout
+
+
+async def within_limit(name: str, call, store: str | None = None):
+    """Await one store's run; past the limit it is stopped, its browser closed, and None returned."""
+    limit = store_time_limit()
+    try:
+        return await asyncio.wait_for(call, timeout=limit)
+    except asyncio.TimeoutError:
+        # Live 7.11: AliExpress hung on a page for 23 minutes, and every later run would have been skipped behind it.
+        logger.warning("%s ran longer than %d minutes and was stopped; the next run tries it again.", name, limit // 60)
+        if cfg.notify_errors and (store is None or cfg.store_notify_enabled(store)):
+            await notify(f"{name} ran longer than {limit // 60} minutes and was stopped; the next run tries it again.")
+        return None
+
+
+async def _meet(store: str, items: list, with_you: bool) -> None:
+    """Run one store for its kept items, then tell you how it went."""
+    name, meet = MEETINGS[store]
+    try:
+        res = await within_limit(f"{name} noVNC meeting", meet(items, with_you), store)
+    except Exception:
+        logger.exception("✗ %s noVNC meeting crashed", name)
+        return
+    found = (res or {}).get("games") or []
+    logger.debug("%s meeting returned: %s", name, [(g.get("title"), g.get("status")) for g in found])
+    games = summary_games({"games": found})
+    if games and cfg.notify_summary and cfg.store_notify_enabled(store):
+        from src.core.notifier import format_game_list
+        how = "with you in noVNC" if with_you else "on its own last try"
+        await notify(f"**{name}** {how}:\n{format_game_list(games)}")
+
+
+async def keep_appointments(final: bool) -> None:
+    """Meet you in noVNC for the kept puzzles once you connected after being asked; with final, wait until each one's time is up."""
+    # Said again after each meeting while something still waits, so the log always shows what the bot is doing.
+    announce = final
+    while booked():
+        if announce:
+            latest = max(item["until"] for items in booked().values() for item in items)
+            logger.info("Waiting for you in noVNC until %s: once you connect, the bot opens the kept checkouts again.",
+                        utc_text(latest))
+            announce = False
+        viewers = vnc_viewers()
+        for store, items in booked().items():
+            # Only a connection that was not there when you were asked counts, so a tab left open does not start it.
+            came = viewers is not None and any(viewers - item["seen"] for item in items)
+            # Read for each store: a meeting before it can take minutes.
+            now = datetime.now(timezone.utc)
+            due = [item for item in items if item["until"] <= now]
+            if came:
+                logger.info("You opened noVNC, so %s opens the checkout of %s again.", MEETINGS[store][0],
+                            ", ".join(f"'{item['title']}'" for item in items))
+                unbook(store, items)
+                await _meet(store, items, True)
+                announce = final
+            elif due:
+                unbook(store, due)
+                own = [item for item in due if item["last_chance"]]
+                for item in due:
+                    if not item["last_chance"]:
+                        logger.info("Nobody came for '%s' in noVNC, it waits for the next run.", item["title"])
+                if own:
+                    logger.info("Trying once more by itself before the giveaway ends, nobody came in noVNC for %s.",
+                                ", ".join(f"'{item['title']}'" for item in own))
+                    await _meet(store, own, False)
+                    announce = final
+        if not final:
+            return
+        if booked():
+            await asyncio.sleep(MEETING_LOOK)
+
+
+class _RunErrorTracker(logging.Handler):
+    """Record ERROR/CRITICAL logs on `fgc.*` during one run so empty summaries don't claim all stores succeeded."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.ERROR)
+        self.errors: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.errors.append(record.getMessage())
+
+
+async def _send_empty_summary(all_failed_games: list[tuple[str, dict]], run_errors: list[str]) -> None:
+    """Send a German status notification when a run produced no visible summary entries."""
+    if isinstance(cfg.stores, str):
+        stores_list = [s.strip().upper() for s in cfg.stores.split(",") if s.strip()]
+    else:
+        stores_list = [str(s).upper() for s in cfg.stores]
+    stores_str = ", ".join(stores_list)
+
+    if all_failed_games:
+        fail_lines = [f"• **{store}**: {g.get('title')} ({g.get('status')})" for store, g in all_failed_games[:10]]
+        if len(all_failed_games) > 10:
+            fail_lines.append(f"... und {len(all_failed_games) - 10} weitere.")
+        await notify(
+            f"⚠️ **Free Games Claimer (PC-Start): Achtung, Probleme aufgetreten!**\n"
+            f"Bei {len(all_failed_games)} Spiel(en) gab es Fehler (z. B. Store nicht eingeloggt):\n\n"
+            + "\n".join(fail_lines) +
+            "\n\n👉 Bitte prüfe deine Logindaten in der `.env` oder starte `EINMALIG_EINLOGGEN.bat`."
+        )
+    elif run_errors:
+        await notify(
+            f"⚠️ **Free Games Claimer (PC-Start): Durchlauf mit {len(run_errors)} Fehler(n) beendet.**\n"
+            "Mindestens ein Store konnte nicht vollständig geprüft werden (Details siehe Fehlermeldung oben bzw. `data/claimer.log`)."
+        )
+    else:
+        await notify(
+            f"⚠️ **Free Games Claimer (PC-Start): Keine neuen Games da!**\n"
+            f"Aktuell sind alle deine Stores ({stores_str}) auf dem neuesten Stand. Es gab keine neuen Gratis-Games zum Aktivieren. ✅"
+        )
+
+
 async def run_claimers() -> None:
     """Run selected claimers sequentially (they each open their own browser)."""
     # Each run starts fresh: a store that was waiting for you hours ago gets another chance.
@@ -412,187 +607,186 @@ async def run_claimers() -> None:
         logger.warning("No valid stores selected. Nothing to do.")
         return
 
-    store_names = [name for _, name, _ in claimers]
-    logger.info("🎮 Starting claiming run… %s", ", ".join(
-        store_names + [_KEY_TO_DISPLAY.get(k, k) for k in sides] + [REDEEM_STORES[k] for k in redeemers]))
-
-    # Long-running containers never restart, so this is the only place they'd hear about a release.
-    await notify_if_update_available()
-
-    # Before any browser starts, so every store's Chrome shows the time zone your IP address is in.
+    error_tracker = _RunErrorTracker()
+    fgc_logger = logging.getLogger("fgc")
+    fgc_logger.addHandler(error_tracker)
     try:
-        await refresh_browser_timezone()
-    except Exception as e:
-        logger.debug("Browser time zone left as it was: %s", e)
+        store_names = [name for _, name, _ in claimers]
+        logger.info("🎮 Starting claiming run… %s", ", ".join(
+            store_names + [_KEY_TO_DISPLAY.get(k, k) for k in sides] + [REDEEM_STORES[k] for k in redeemers]))
 
-    # GamerPower first: it finds giveaways, the stores below claim them. One pass, and only
-    # when something in this run can use it.
-    routed: dict = {}
-    if sides or any(key in GP_TARGETS for key in selected):
-        routed = await discover_giveaways()
+        # Long-running containers never restart, so this is the only place they'd hear about a release.
+        await notify_if_update_available()
 
-    aggregated_results = []
-
-    for key, name, func in claimers:
+        # Before any browser starts, so every store's Chrome shows the time zone your IP address is in.
         try:
-            logger.debug("▶ Running %s claimer…", name)
-            res = await func(routed.get(key)) if key in GP_TARGETS else await func()
-            if isinstance(res, dict):
-                # Titles only: Prime's statuses and links carry whole game codes.
-                logger.debug("%s returned %d game entr(ies): %s", name, len(res.get("games") or []),
-                             [g.get("title") for g in res.get("games") or []])
-            if isinstance(res, dict) and res.get("games"):
-                aggregated_results.append(res)
-        except Exception:
-            logger.exception("✗ %s crashed", name)
-            if cfg.notify_errors and cfg.store_notify_enabled(_store_key(name)):
-                await notify(f"{name} claimer crashed with an unhandled exception. Check logs.")
+            await refresh_browser_timezone()
+        except Exception as e:
+            logger.debug("Browser time zone left as it was: %s", e)
 
-    # After standard claimers finish, check for pending GOG codes from Prime Gaming.
-    # Only run if there are actually codes with status="claimed" waiting,
-    # or if GOG_FORCE_REDEEM is explicitly enabled.
-    if "GOG" not in store_names:
-        logger.debug("Skipping pending GOG codes redemption as 'gog' is not in STORES.")
-    else:
-        try:
-            from src.core.database import async_session, ClaimedGame
-            from sqlalchemy import select
-            
-            # Quick check: are there any pending GOG codes at all?
-            has_pending = False
-            async with async_session() as session:
-                if cfg.gog_force_redeem:
-                    has_pending = True  # Force mode: always check
-                else:
-                    stmt = select(ClaimedGame).where(
-                        ClaimedGame.status == "claimed",
-                        ClaimedGame.code.isnot(None),
-                        ClaimedGame.code != ""
-                    ).limit(1)
-                    result = await session.execute(stmt)
-                    has_pending = result.scalars().first() is not None
-            
-            if has_pending:
-                from src.stores.gog import GOGClaimer
-                gog = GOGClaimer()
-                await gog.redeem_pending_codes()
-                if gog.notify_games:
-                    gog_entry = next((e for e in aggregated_results if e["store"] == "GOG"), None)
-                    if gog_entry:
-                        gog_entry["games"].extend(gog.notify_games)
+        # GamerPower first: it finds giveaways, the stores below claim them. One pass, and only
+        # when something in this run can use it.
+        routed: dict = {}
+        if sides or any(key in GP_TARGETS for key in selected):
+            routed = await discover_giveaways()
+
+        aggregated_results = []
+
+        for key, name, func in claimers:
+            try:
+                logger.debug("▶ Running %s claimer…", name)
+                res = await within_limit(name, func(routed.get(key)) if key in GP_TARGETS else func(), _store_key(name))
+                if isinstance(res, dict):
+                    # Titles only: Prime's statuses and links carry whole game codes.
+                    logger.debug("%s returned %d game entr(ies): %s", name, len(res.get("games") or []),
+                                 [g.get("title") for g in res.get("games") or []])
+                if isinstance(res, dict) and res.get("games"):
+                    aggregated_results.append(res)
+            except Exception:
+                logger.exception("✗ %s crashed", name)
+                if cfg.notify_errors and cfg.store_notify_enabled(_store_key(name)):
+                    await notify(f"{name} claimer crashed with an unhandled exception. Check logs.")
+            # Between stores, never inside one: you may have opened noVNC for a kept puzzle meanwhile.
+            await keep_appointments(final=False)
+            await tell_bookings()
+
+        # After standard claimers finish, check for pending GOG codes from Prime Gaming.
+        # Only run if there are actually codes with status="claimed" waiting,
+        # or if GOG_FORCE_REDEEM is explicitly enabled.
+        if "GOG" not in store_names:
+            logger.debug("Skipping pending GOG codes redemption as 'gog' is not in STORES.")
+        else:
+            try:
+                from src.core.database import async_session, ClaimedGame
+                from sqlalchemy import select
+                
+                # Quick check: are there any pending GOG codes at all?
+                has_pending = False
+                async with async_session() as session:
+                    if cfg.gog_force_redeem:
+                        has_pending = True  # Force mode: always check
                     else:
-                        aggregated_results.append({"store": "GOG", "user": gog.user, "games": gog.notify_games})
-            else:
-                logger.debug("No pending GOG codes to redeem.")
-        except Exception:
-            logger.exception("Failed to run post-claim GOG code redemption")
-
-    # Microsoft codes from Prime Gaming, redeemed here so Prime has already saved this run's codes.
-    if "Microsoft" not in store_names:
-        logger.debug("Skipping pending Microsoft codes as 'microsoft' is not in STORES.")
-    else:
-        try:
-            from src.stores.microsoft import MicrosoftClaimer
-
-            ms_claimer = MicrosoftClaimer()
-            await ms_claimer.redeem_pending_codes()
-            if ms_claimer.notify_games:
-                ms_entry = next((e for e in aggregated_results if e["store"] == "Microsoft"), None)
-                if ms_entry:
-                    ms_entry["games"].extend(ms_claimer.notify_games)
+                        stmt = select(ClaimedGame).where(
+                            ClaimedGame.status == "claimed",
+                            ClaimedGame.code.isnot(None),
+                            ClaimedGame.code != ""
+                        ).limit(1)
+                        result = await session.execute(stmt)
+                        has_pending = result.scalars().first() is not None
+                
+                if has_pending:
+                    from src.stores.gog import GOGClaimer
+                    gog = GOGClaimer()
+                    await within_limit("GOG code redemption", gog.redeem_pending_codes(), "gog")
+                    if gog.notify_games:
+                        gog_entry = next((e for e in aggregated_results if e["store"] == "GOG"), None)
+                        if gog_entry:
+                            gog_entry["games"].extend(gog.notify_games)
+                        else:
+                            aggregated_results.append({"store": "GOG", "user": gog.user, "games": gog.notify_games})
                 else:
+                    logger.debug("No pending GOG codes to redeem.")
+            except Exception:
+                logger.exception("Failed to run post-claim GOG code redemption")
+
+        # Microsoft codes from Prime Gaming, redeemed here so Prime has already saved this run's codes.
+        if "Microsoft" not in store_names:
+            logger.debug("Skipping pending Microsoft codes as 'microsoft' is not in STORES.")
+        else:
+            try:
+                from src.stores.microsoft import MicrosoftClaimer
+
+                ms_claimer = MicrosoftClaimer()
+                await within_limit("Microsoft code redemption", ms_claimer.redeem_pending_codes(), "microsoft")
+                if ms_claimer.notify_games:
+                    ms_entry = next((e for e in aggregated_results if e["store"] == "Microsoft"), None)
+                    if ms_entry:
+                        ms_entry["games"].extend(ms_claimer.notify_games)
+                    else:
+                        aggregated_results.append(
+                            {"store": "Microsoft", "user": ms_claimer.user, "games": ms_claimer.notify_games}
+                        )
+            except Exception:
+                logger.exception("Failed to run post-claim Microsoft code redemption")
+
+        # Legacy Games codes from Prime Gaming, redeemed into the LG_EMAIL account in the same run: they expire within days.
+        if "legacygames" not in redeemers:
+            logger.debug("Skipping Legacy Games codes as 'legacy' is not in STORES.")
+        else:
+            try:
+                from src.stores.legacygames import LegacyGamesClaimer
+
+                lg_claimer = LegacyGamesClaimer()
+                await within_limit("Legacy Games code redemption", lg_claimer.redeem_pending_codes(), "legacygames")
+                if lg_claimer.notify_games:
                     aggregated_results.append(
-                        {"store": "Microsoft", "user": ms_claimer.user, "games": ms_claimer.notify_games}
+                        {"store": "Legacy Games", "user": lg_claimer.user, "games": lg_claimer.notify_games}
                     )
-        except Exception:
-            logger.exception("Failed to run post-claim Microsoft code redemption")
+            except Exception:
+                logger.exception("Failed to run post-claim Legacy Games code redemption")
 
-    # Legacy Games codes from Prime Gaming, redeemed into the LG_EMAIL account in the same run: they expire within days.
-    if "legacygames" not in redeemers:
-        logger.debug("Skipping Legacy Games codes as 'legacy' is not in STORES.")
-    else:
-        try:
-            from src.stores.legacygames import LegacyGamesClaimer
+        # Last: the sites with no module of their own, all in one browser window.
+        # Also without new giveaways: a Fanatical key that did not show at its claim is looked for here.
+        if sides:
+            try:
+                res = await within_limit("GamerPower side stores", claim_side_stores(routed))
+                if isinstance(res, dict) and res.get("games"):
+                    aggregated_results.append(res)
+            except Exception:
+                logger.exception("✗ GamerPower side stores crashed")
 
-            lg_claimer = LegacyGamesClaimer()
-            await lg_claimer.redeem_pending_codes()
-            if lg_claimer.notify_games:
-                aggregated_results.append(
-                    {"store": "Legacy Games", "user": lg_claimer.user, "games": lg_claimer.notify_games}
-                )
-        except Exception:
-            logger.exception("Failed to run post-claim Legacy Games code redemption")
+        # Steam keys a side site handed out (Fanatical), activated after the sites that hand them out.
+        if "Steam" in store_names:
+            try:
+                from src.stores.steam import SteamClaimer
 
-    # Last: the sites with no module of their own, all in one browser window.
-    if sides and routed:
-        try:
-            res = await claim_side_stores(routed)
-            if isinstance(res, dict) and res.get("games"):
-                aggregated_results.append(res)
-        except Exception:
-            logger.exception("✗ GamerPower side stores crashed")
+                steam_keys = SteamClaimer()
+                await within_limit("Steam key activation", steam_keys.redeem_pending_keys(), "steam")
+                if steam_keys.notify_games:
+                    steam_entry = next((e for e in aggregated_results if e["store"] == "Steam"), None)
+                    if steam_entry:
+                        steam_entry["games"].extend(steam_keys.notify_games)
+                    else:
+                        aggregated_results.append({"store": "Steam", "user": steam_keys.user, "games": steam_keys.notify_games})
+            except Exception:
+                logger.exception("Failed to activate pending Steam keys")
 
-    # Steam keys a side site handed out (Fanatical), activated after the sites that hand them out.
-    if "Steam" in store_names:
-        try:
-            from src.stores.steam import SteamClaimer
-
-            steam_keys = SteamClaimer()
-            await steam_keys.redeem_pending_keys()
-            if steam_keys.notify_games:
-                steam_entry = next((e for e in aggregated_results if e["store"] == "Steam"), None)
-                if steam_entry:
-                    steam_entry["games"].extend(steam_keys.notify_games)
-                else:
-                    aggregated_results.append({"store": "Steam", "user": steam_keys.user, "games": steam_keys.notify_games})
-        except Exception:
-            logger.exception("Failed to activate pending Steam keys")
-
-    # Final Summary Notification
-    # A store that only waited for you returns no games, and "Needed you" must still arrive.
-    if cfg.notify_summary and (aggregated_results or waiting_for_you()):
-        from src.core.notifier import format_game_list, markdown_safe
-        msg_parts = []
-        if aggregated_results:
+        # Final Summary Notification
+        # A store that only waited for you returns no games, and "Needed you" must still arrive.
+        await keep_appointments(final=False)
+        if cfg.notify_summary and (aggregated_results or waiting_for_you() or booked()):
+            from src.core.notifier import format_game_list, markdown_safe
+            msg_parts = []
             for result in aggregated_results:
                 # Skip stores whose notifications are silenced (NOTIFY_SKIP_STORES).
                 if not cfg.store_notify_enabled(_store_key(result.get("store", ""))):
                     continue
-                # Owned and skipped entries need NOTIFY_ALREADY_CLAIMED (off), failed ones NOTIFY_CLAIM_FAILS (on).
-                keep_owned = cfg.notify_already_claimed
-                relevant_games = [
-                    g for g in result["games"]
-                    if "status" in g
-                    and (keep_owned or "exist" not in g["status"].lower())
-                    and (keep_owned or "already" not in g["status"].lower())
-                    and (keep_owned or "skip" not in g["status"].lower() or "dry run" in g["status"].lower())
-                    and (cfg.notify_claim_fails or "fail" not in g["status"].lower())
-                    and (cfg.notify_missing_base or "missing_base" not in g["status"].lower())
-                    and "skipped:missing_base" not in g["status"].lower()
-                    and (cfg.notify_download_only or "download" not in g["status"].lower())
-                ]
-                
+                relevant_games = summary_games(result)
+
                 if not relevant_games:
                     logger.debug("Summary: nothing to report for %s (all %d entr(ies) filtered out)",
                                  result.get("store"), len(result["games"]))
                     continue
-                    
+
                 # The mask's "***" would open bold on Discord and Telegram and swallow the line below.
                 account = markdown_safe(mask_account(result.get('user'))) if result.get('user') else ""
                 header = f"**{result['store']}** ({account}):" if account else f"**{result['store']}**:"
                 msg_parts.append(f"{header}\n{format_game_list(relevant_games)}")
-            
-        # Kept out of the per-store lists: the summary filter drops anything that says "skipped".
-        stuck = {(name, why, item): n for (name, why, item), n in waiting_for_you().items() if cfg.store_notify_enabled(name)}
-        if stuck:
-            lines = [f"**{_KEY_TO_DISPLAY.get(name, name.title())}**: {describe_wait(why, count, item)}"
-                     for (name, why, item), count in sorted(stuck.items())]
-            msg_parts.append("🙋 Needed you:\n" + "\n".join(lines))
 
-        # Check if ANY game was actually successfully claimed or if errors occurred
-        has_success = False
-        all_failed_games = []
-        if aggregated_results:
+            # Kept out of the per-store lists: the summary filter drops anything that says "skipped".
+            stuck = {(name, why, item): n for (name, why, item), n in waiting_for_you().items() if cfg.store_notify_enabled(name)}
+            if stuck:
+                lines = [f"**{_KEY_TO_DISPLAY.get(name, name.title())}**: {describe_wait(why, count, item)}"
+                         for (name, why, item), count in sorted(stuck.items())]
+                msg_parts.append("🙋 Needed you:\n" + "\n".join(lines))
+
+            kept = kept_lines()
+            if kept:
+                msg_parts.append("🧩 Waiting for you in noVNC (the bot opens the checkout once you connect):\n" + "\n".join(kept))
+
+            # Check if ANY game was actually successfully claimed or if errors occurred
+            has_success = False
+            all_failed_games = []
             for res in aggregated_results:
                 for g in res.get("games", []):
                     st = g.get("status", "").lower()
@@ -605,40 +799,25 @@ async def run_claimers() -> None:
                     ):
                         all_failed_games.append((res.get("store", "Store"), g))
 
-        if msg_parts:
-            header = "🎉 **Free Games Claimer (PC-Start) - Neue Spiele gesichert:**" if has_success else "⚠️ **Free Games Claimer (PC-Start) - Status & Meldungen:**"
-            final_msg = f"{header}\n\n" + "\n\n".join(msg_parts)
-            if cfg.dryrun:
-                final_msg = "🛑 **DRY RUN SUMMARY: games remaining to be claimed**\n\n" + final_msg
-            await notify(final_msg)
-        elif getattr(cfg, "notify_empty_summary", True):
-            if isinstance(cfg.stores, str):
-                stores_list = [s.strip().upper() for s in cfg.stores.split(",") if s.strip()]
-            else:
-                stores_list = [str(s).upper() for s in cfg.stores]
-            stores_str = ", ".join(stores_list)
+            if msg_parts:
+                header = "🎉 **Free Games Claimer (PC-Start) - Neue Spiele gesichert:**" if has_success else "⚠️ **Free Games Claimer (PC-Start) - Status & Meldungen:**"
+                final_msg = f"{header}\n\n" + "\n\n".join(msg_parts)
+                if cfg.dryrun:
+                    final_msg = "🛑 **DRY RUN SUMMARY: games remaining to be claimed**\n\n" + final_msg
+                await notify(final_msg)
+            elif getattr(cfg, "notify_empty_summary", True):
+                await _send_empty_summary(all_failed_games, error_tracker.errors)
+        elif cfg.notify_summary and getattr(cfg, "notify_empty_summary", True):
+            await _send_empty_summary([], error_tracker.errors)
 
-            if all_failed_games:
-                fail_lines = [f"• **{store}**: {g.get('title')} ({g.get('status')})" for store, g in all_failed_games[:10]]
-                if len(all_failed_games) > 10:
-                    fail_lines.append(f"... und {len(all_failed_games) - 10} weitere.")
-                await notify(
-                    f"⚠️ **Free Games Claimer (PC-Start): Achtung, Probleme aufgetreten!**\n"
-                    f"Bei {len(all_failed_games)} Spiel(en) gab es Fehler (z. B. Store nicht eingeloggt):\n\n"
-                    + "\n".join(fail_lines) +
-                    f"\n\n👉 Bitte prüfe deine Logindaten in der `.env` oder starte `EINMALIG_EINLOGGEN.bat`."
-                )
-            else:
-                await notify(f"⚠️ **Free Games Claimer (PC-Start): Keine neuen Games da!**\nAktuell sind alle deine Stores ({stores_str}) auf dem neuesten Stand. Es gab keine neuen Gratis-Games zum Aktivieren. ✅")
-    elif cfg.notify_summary and getattr(cfg, "notify_empty_summary", True):
-        if isinstance(cfg.stores, str):
-            stores_list = [s.strip().upper() for s in cfg.stores.split(",") if s.strip()]
-        else:
-            stores_list = [str(s).upper() for s in cfg.stores]
-        stores_str = ", ".join(stores_list)
-        await notify(f"⚠️ **Free Games Claimer (PC-Start): Keine neuen Games da!**\nAktuell sind alle deine Stores ({stores_str}) auf dem neuesten Stand. Es gab keine neuen Gratis-Games zum Aktivieren. ✅")
-
-    logger.info("✔ Claiming run complete.")
+        # How often each store asked, so a store that asks too often shows up in any log you send.
+        asked = week_summary()
+        if asked:
+            logger.info("Human checks in the last 7 days: %s.", asked)
+        await keep_appointments(final=True)
+        logger.info("✔ Claiming run complete.")
+    finally:
+        fgc_logger.removeHandler(error_tracker)
 
 
 async def reset_recent_games(session_factory=None, days: int = 7) -> int:
@@ -698,6 +877,8 @@ async def main() -> None:
                 logger.debug("DB reset requested, but no entries found from the last 7 days.")
         except Exception as e:
             logger.error("Failed to reset DB games: %s", e)
+
+    await warn_open_novnc()
 
     # Send a test notification if NOTIFY_TEST=true (for verifying notification setup)
     if cfg.notify_test:
